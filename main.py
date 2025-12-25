@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 app = FastAPI(title="Akwam Scraper API - Ultra Fast")
 
 # Thread pool للعمليات المتزامنة
-executor = ThreadPoolExecutor(max_workers=10)
+executor = ThreadPoolExecutor(max_workers=15)
 
 # --- CORS ---
 app.add_middleware(
@@ -92,6 +92,32 @@ GENRES = [
     {"id": 87, "name": "رمضان"}, {"id": 72, "name": "Netflix"}
 ]
 
+# --- Compiled Regex Patterns ---
+VIDEO_SOURCE_PATTERN = re.compile(
+    r'<source[^>]*(?:src=["\']([^"\']+)["\'][^>]*size=["\'](\d+)["\']|size=["\'](\d+)["\'][^>]*src=["\']([^"\']+)["\'])',
+    re.IGNORECASE
+)
+REDIRECT_PATTERN_1 = re.compile(r'<a[^>]*href=["\']([^"\']*ak\.sv/watch[^"\']*)["\']', re.IGNORECASE)
+REDIRECT_PATTERN_2 = re.compile(r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>(?:اضغط هنا|Click here)', re.IGNORECASE)
+VIDEO_TAG_CHECK = re.compile(r'<video[^>]*id=["\']player["\']', re.IGNORECASE)
+
+# Regex للـ movie details - استخراج بدون BeautifulSoup
+TITLE_PATTERN = re.compile(r'<h1[^>]*class=["\']entry-title["\'][^>]*>([^<]+)</h1>', re.IGNORECASE)
+POSTER_JSON_PATTERN = re.compile(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>([^<]+)</script>', re.IGNORECASE)
+STORY_PATTERN = re.compile(r'<div[^>]*class=["\']widget-body[^"\']*["\'][^>]*>.*?<h2[^>]*>.*?<span[^>]*class=["\']text-white["\'][^>]*>([^<]+)</span>', re.DOTALL | re.IGNORECASE)
+
+# Regex لاستخراج روابط الجودات
+QUALITY_TAB_PATTERN = re.compile(r'<li[^>]*>\s*<a[^>]*href=["\']#([^"\']+)["\'][^>]*>([^<]+)</a>', re.IGNORECASE)
+WATCH_LINK_PATTERN = re.compile(r'<a[^>]*class=["\'][^"\']*link-show[^"\']*["\'][^>]*href=["\']([^"\']+)["\']', re.IGNORECASE)
+DOWNLOAD_LINK_PATTERN = re.compile(r'<a[^>]*class=["\'][^"\']*link-download[^"\']*["\'][^>]*href=["\']([^"\']+)["\']', re.IGNORECASE)
+SIZE_PATTERN = re.compile(r'<span[^>]*class=["\'][^"\']*font-size-14[^"\']*["\'][^>]*>([^<]+)</span>', re.IGNORECASE)
+
+# Regex للحلقات
+EPISODE_PATTERN = re.compile(
+    r'<div[^>]*class=["\'][^"\']*col-lg-4[^"\']*["\'][^>]*>.*?<h2[^>]*>.*?<a[^>]*href=["\']([^"\']+)["\'][^>]*>([^<]+)</a>.*?<img[^>]*src=["\']([^"\']+)["\']',
+    re.DOTALL | re.IGNORECASE
+)
+
 # --- Helper Functions ---
 def fix_url(url):
     if not url.startswith("http"):
@@ -134,7 +160,7 @@ def parse_grid(soup):
 def fetch_page(url, params=None):
     try:
         with get_scraper(referer=url) as scraper:
-            resp = scraper.get(url, params=params, timeout=10)
+            resp = scraper.get(url, params=params, timeout=8)
             if resp.status_code != 200:
                 raise HTTPException(404, "Page not found")
             soup = BeautifulSoup(resp.content, "html.parser")
@@ -153,9 +179,9 @@ def fetch_page(url, params=None):
 @app.get("/")
 def home():
     return {
-        "message": "Akwam API - Ultra Fast",
-        "version": "3.0",
-        "endpoints": ["/movies", "/series", "/search", "/movie", "/show", "/watch"]
+        "message": "Akwam API - Ultra Fast v3.1",
+        "version": "3.1",
+        "endpoints": ["/movies", "/series", "/search", "/movie", "/show", "/watch", "/watch-direct"]
     }
 
 @app.get("/categories")
@@ -192,118 +218,151 @@ def search(q: str, page: int = 1):
         params["page"] = page
     return fetch_page(f"{BASE_URL}/search", params=params)
 
-# --- Content Details ---
-def get_content_details(url: str, is_movie: bool):
+# --- ULTRA FAST Content Details ---
+
+def extract_title_fast(html: str) -> str:
+    """استخراج العنوان بسرعة بدون BeautifulSoup"""
+    match = TITLE_PATTERN.search(html)
+    return match.group(1).strip() if match else "Unknown"
+
+def extract_poster_fast(html: str) -> str:
+    """استخراج الصورة بسرعة"""
+    # محاولة JSON-LD أولاً
+    for match in POSTER_JSON_PATTERN.finditer(html):
+        try:
+            data = json.loads(match.group(1))
+            if isinstance(data, list) and 'image' in data[0]:
+                img = data[0]['image']
+                return img[0] if isinstance(img, list) else img
+            elif 'image' in data:
+                img = data['image']
+                return img[0] if isinstance(img, list) else img
+        except:
+            continue
+    
+    # Fallback: ابحث عن img في movie-cover
+    img_match = re.search(r'<div[^>]*class=["\']movie-cover[^"\']*["\'][^>]*>.*?<img[^>]*src=["\']([^"\']+)["\']', html, re.DOTALL | re.IGNORECASE)
+    if img_match:
+        return get_high_quality_image(img_match.group(1))
+    
+    return ""
+
+def extract_story_fast(html: str) -> str:
+    """استخراج القصة بسرعة"""
+    match = STORY_PATTERN.search(html)
+    return match.group(1).strip() if match else ""
+
+def extract_movie_links_fast(html: str) -> list:
+    """استخراج روابط الفيلم بسرعة فائقة"""
+    links = []
+    
+    # استخراج التابات (الجودات)
+    tabs = QUALITY_TAB_PATTERN.findall(html)
+    
+    for tab_id, quality_name in tabs:
+        # البحث عن محتوى هذا التاب
+        tab_content_pattern = re.compile(
+            rf'<div[^>]*id=["\']({re.escape(tab_id)})["\'][^>]*>(.*?)</div>',
+            re.DOTALL | re.IGNORECASE
+        )
+        tab_match = tab_content_pattern.search(html)
+        
+        if tab_match:
+            content = tab_match.group(2)
+            
+            watch_match = WATCH_LINK_PATTERN.search(content)
+            download_match = DOWNLOAD_LINK_PATTERN.search(content)
+            size_match = SIZE_PATTERN.search(content)
+            
+            links.append({
+                "quality": quality_name.strip(),
+                "size": size_match.group(1).strip() if size_match else "",
+                "watch_url": watch_match.group(1) if watch_match else None,
+                "download_url": download_match.group(1) if download_match else None
+            })
+    
+    return links
+
+def extract_episodes_fast(html: str) -> list:
+    """استخراج الحلقات بسرعة فائقة"""
+    episodes = []
+    
+    for match in EPISODE_PATTERN.finditer(html):
+        link, name, img = match.groups()
+        episodes.append({
+            "name": name.strip(),
+            "link": fix_url(link),
+            "image": get_high_quality_image(img)
+        })
+    
+    return episodes
+
+@app.get("/movie")
+async def movie_details(url: str):
+    """جلب تفاصيل الفيلم بأقصى سرعة"""
     try:
         url = fix_url(url)
-        with get_scraper(referer=url) as scraper:
-            resp = scraper.get(url, timeout=15)
-            if resp.status_code != 200:
-                raise HTTPException(404, "Content not found")
-            
-            soup = BeautifulSoup(resp.content, "html.parser")
-            title_elem = soup.select_one("h1.entry-title")
-            title = title_elem.text.strip() if title_elem else "Unknown"
-            
-            poster = ""
-            try:
-                for script in soup.find_all('script', type='application/ld+json'):
-                    if script.string:
-                        data = json.loads(script.string)
-                        if isinstance(data, list) and 'image' in data[0]:
-                            poster = data[0]['image'][0] if isinstance(data[0]['image'], list) else data[0]['image']
-                            break
-            except:
-                pass
-            
-            if not poster:
-                poster_img = soup.select_one("div.movie-cover img")
-                if poster_img:
-                    raw_poster = poster_img.get('src', '')
-                    poster = get_high_quality_image(raw_poster)
-
-            story_elem = soup.select_one("div.widget-body h2 .text-white")
-            story = story_elem.text.strip() if story_elem else ""
-
-            if is_movie:
-                links = []
-                tabs = soup.select("ul.header-tabs li a")
-                for tab in tabs:
-                    content = soup.select_one(tab['href'])
-                    if content:
-                        watch = content.select_one("a.link-show")
-                        dl = content.select_one("a.link-download")
-                        size = content.select_one("a.link-download span.font-size-14")
-                        links.append({
-                            "quality": tab.text.strip(),
-                            "size": size.text.strip() if size else "",
-                            "watch_url": watch['href'] if watch else None,
-                            "download_url": dl['href'] if dl else None
-                        })
+        
+        def fetch():
+            with get_scraper(referer=url) as scraper:
+                resp = scraper.get(url, timeout=8)
+                if resp.status_code != 200:
+                    raise HTTPException(404, "Content not found")
+                
+                html = resp.text
                 
                 return {
                     "status": "success",
                     "type": "movie",
                     "details": {
-                        "title": title,
-                        "poster": poster,
-                        "story": story,
-                        "links": links
+                        "title": extract_title_fast(html),
+                        "poster": extract_poster_fast(html),
+                        "story": extract_story_fast(html),
+                        "links": extract_movie_links_fast(html)
                     }
                 }
-            else:
-                episodes = []
-                ep_container = soup.select_one("#series-episodes .widget-body .row")
-                if ep_container:
-                    for card in ep_container.find_all("div", class_=lambda x: x and "col-lg-4" in x):
-                        tag = card.select_one("h2 a")
-                        if not tag:
-                            continue
-                        img = card.select_one("img")
-                        raw_img = img['src'] if img else ""
-                        episodes.append({
-                            "name": tag.text.strip(),
-                            "link": fix_url(tag['href']),
-                            "image": get_high_quality_image(raw_img)
-                        })
+        
+        return await asyncio.get_event_loop().run_in_executor(executor, fetch)
+    except Exception as e:
+        raise HTTPException(500, f"Error: {str(e)}")
+
+@app.get("/show")
+async def series_details(url: str):
+    """جلب تفاصيل المسلسل بأقصى سرعة"""
+    try:
+        url = fix_url(url)
+        
+        def fetch():
+            with get_scraper(referer=url) as scraper:
+                resp = scraper.get(url, timeout=8)
+                if resp.status_code != 200:
+                    raise HTTPException(404, "Content not found")
+                
+                html = resp.text
+                episodes = extract_episodes_fast(html)
                 
                 return {
                     "status": "success",
                     "type": "series",
                     "details": {
-                        "title": title,
-                        "poster": poster,
-                        "story": story,
+                        "title": extract_title_fast(html),
+                        "poster": extract_poster_fast(html),
+                        "story": extract_story_fast(html),
                         "episodes_count": len(episodes),
                         "episodes": episodes
                     }
                 }
+        
+        return await asyncio.get_event_loop().run_in_executor(executor, fetch)
     except Exception as e:
         raise HTTPException(500, f"Error: {str(e)}")
 
-@app.get("/movie")
-def movie_details(url: str):
-    return get_content_details(url, is_movie=True)
-
-@app.get("/show")
-def series_details(url: str):
-    return get_content_details(url, is_movie=False)
-
 # --- ULTRA FAST VIDEO EXTRACTION ---
 
-# Cache للـ regex patterns (compile مرة واحدة فقط)
-VIDEO_SOURCE_PATTERN = re.compile(
-    r'<source[^>]*(?:src=["\']([^"\']+)["\'][^>]*size=["\'](\d+)["\']|size=["\'](\d+)["\'][^>]*src=["\']([^"\']+)["\'])',
-    re.IGNORECASE
-)
-REDIRECT_PATTERN_1 = re.compile(r'<a[^>]*href=["\']([^"\']*ak\.sv/watch[^"\']*)["\']', re.IGNORECASE)
-REDIRECT_PATTERN_2 = re.compile(r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>(?:اضغط هنا|Click here)', re.IGNORECASE)
-VIDEO_TAG_CHECK = re.compile(r'<video[^>]*id=["\']player["\']', re.IGNORECASE)
-
-def extract_videos_ultra_fast(html_chunk: str):
-    """استخراج روابط الفيديو بأقصى سرعة باستخدام regex مُحسّن"""
+def extract_videos_ultra_fast(html: str) -> list:
+    """استخراج روابط الفيديو بأقصى سرعة"""
     videos = []
-    for match in VIDEO_SOURCE_PATTERN.finditer(html_chunk):
+    for match in VIDEO_SOURCE_PATTERN.finditer(html):
         src = match.group(1) or match.group(4)
         size = match.group(2) or match.group(3)
         if src and size:
@@ -314,43 +373,42 @@ def extract_videos_ultra_fast(html_chunk: str):
             })
     return videos
 
-def find_redirect_ultra_fast(html_chunk: str):
+def find_redirect_ultra_fast(html: str) -> Optional[str]:
     """البحث عن رابط التوجيه بأقصى سرعة"""
-    match = REDIRECT_PATTERN_1.search(html_chunk)
+    match = REDIRECT_PATTERN_1.search(html)
     if match:
         return match.group(1)
-    match = REDIRECT_PATTERN_2.search(html_chunk)
+    match = REDIRECT_PATTERN_2.search(html)
     if match:
         return match.group(1)
     return None
 
 @app.get("/watch")
 async def watch_video(url: str):
-    """جلب روابط MP4 بأقصى سرعة ممكنة - محسّن جداً"""
+    """جلب روابط MP4 بأقصى سرعة - نسخة محسّنة"""
     try:
         url = fix_url(url)
         
         def fetch_video():
             with get_scraper(referer=url) as scraper:
-                # الطلب الأول - بدون stream للحصول على الاستجابة الكاملة مباشرة
-                resp = scraper.get(url, timeout=8)
+                resp = scraper.get(url, timeout=7)
                 html = resp.text
                 
-                # فحص سريع: هل توجد روابط فيديو مباشرة؟
+                # فحص وجود فيديو مباشر
                 if VIDEO_TAG_CHECK.search(html):
                     videos = extract_videos_ultra_fast(html)
                     if videos:
                         return {"status": "success", "original_url": url, "videos": videos}
                 
-                # البحث عن رابط التوجيه
+                # البحث عن التوجيه
                 redirect_url = find_redirect_ultra_fast(html)
                 if not redirect_url:
                     return {"status": "failed", "message": "Direct link not found"}
                 
-                # الطلب الثاني للصفحة النهائية
+                # الطلب النهائي
                 final_url = fix_url(redirect_url)
                 scraper.headers.update({"Referer": quote(final_url, safe=":/%?=&")})
-                final_resp = scraper.get(final_url, timeout=8)
+                final_resp = scraper.get(final_url, timeout=7)
                 
                 videos = extract_videos_ultra_fast(final_resp.text)
                 if videos:
@@ -358,10 +416,34 @@ async def watch_video(url: str):
                 
                 return {"status": "failed", "message": "No video sources found"}
         
-        # تشغيل العملية في thread pool
-        result = await asyncio.get_event_loop().run_in_executor(executor, fetch_video)
-        return result
+        return await asyncio.get_event_loop().run_in_executor(executor, fetch_video)
             
+    except Exception as e:
+        raise HTTPException(500, f"Error: {str(e)}")
+
+@app.get("/watch-direct")
+async def watch_direct(watch_url: str):
+    """
+    Endpoint جديد: يجلب mp4 مباشرة من رابط المشاهدة
+    أسرع من /watch لأنه يتخطى خطوة البحث عن الرابط
+    """
+    try:
+        watch_url = fix_url(watch_url)
+        
+        def fetch():
+            with get_scraper(referer=watch_url) as scraper:
+                # طلب واحد فقط مباشرة
+                resp = scraper.get(watch_url, timeout=6)
+                html = resp.text
+                
+                videos = extract_videos_ultra_fast(html)
+                if videos:
+                    return {"status": "success", "url": watch_url, "videos": videos}
+                
+                return {"status": "failed", "message": "No videos found"}
+        
+        return await asyncio.get_event_loop().run_in_executor(executor, fetch)
+    
     except Exception as e:
         raise HTTPException(500, f"Error: {str(e)}")
 
