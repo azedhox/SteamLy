@@ -29,7 +29,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Rate Limiting ---
 rate_limit_storage = defaultdict(list)
 rate_limit_lock = threading.Lock()
 
